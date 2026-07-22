@@ -1,0 +1,23 @@
+{
+  "name": "edgecell-frontend",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "scripts": {
+    "predev": "node scripts/build-wasm.mjs",
+    "dev": "astro dev --host 127.0.0.1",
+    "prebuild": "node scripts/build-wasm.mjs",
+    "build": "astro build && node scripts/extract-inline-scripts.mjs && node scripts/inject-modulepreload.mjs",
+    "preview": "astro preview --host 127.0.0.1"
+  },
+  "dependencies": {
+    "@astrojs/solid-js": "^5.0.0",
+    "astro": "^5.0.0",
+    "protobufjs": "^7.2.5",
+    "solid-js": "^1.8.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "wabt": "^1.0.34"
+  }
+}

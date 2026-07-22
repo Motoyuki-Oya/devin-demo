@@ -1,0 +1,20 @@
+version: '3.8'
+services:
+  dragonfly:
+    image: docker.dragonflydb.io/dragonflydb/dragonfly
+    ports:
+      # 認証なしで動かすため localhost のみに公開する（LAN からの直接アクセスを遮断）
+      - "127.0.0.1:6379:6379"
+    command: >
+      dragonfly
+      --maxmemory=1gb
+      --proactor_threads=4
+    ulimits:
+      memlock: -1
+    restart: always
+
+  # Load testing tool (for later use)
+  k6:
+    image: grafana/k6
+    volumes:
+      - ./k6:/scripts

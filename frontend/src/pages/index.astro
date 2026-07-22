@@ -1,0 +1,35 @@
+---
+import Board from '../components/Board';
+import Counter from '../components/Counter';
+---
+
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>EdgeCell 掲示板</title>
+  </head>
+  <body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; line-height: 1.5; background: #f5f6f8;">
+    <main style="max-width: 720px; margin: 0 auto;">
+      <h1 style="margin: 0 0 12px;">EdgeCell 掲示板</h1>
+      <p style="margin: 0 0 24px; color: #333;">
+        投稿すると WebSocket + Redis Pub/Sub 経由でリアルタイムに全員へ配信される簡易掲示板です（認証なし）。
+      </p>
+
+      <section style="padding: 20px; border: 1px solid #ddd; border-radius: 12px; background: #fff;">
+        <Board client:only="solid-js" />
+      </section>
+
+      <details style="margin-top: 24px;">
+        <summary style="cursor: pointer; color: #666;">Redis 共有カウンターのデモも見る</summary>
+        <section style="margin-top: 12px; padding: 16px; border: 1px solid #ddd; border-radius: 12px; background: #fff;">
+          <h2 style="margin: 0 0 8px;">Redis Shared Counter</h2>
+          <p style="margin: 0 0 16px; color: #444;">
+            Backend (Redis) 上の値を WebSocket でリアルタイム同期しています。
+          </p>
+          <Counter client:only="solid-js" />
+        </section>
+      </details>
+    </main>
+  </body>
+</html>

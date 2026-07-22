@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package edgecell;
+
+option java_package = "com.edgecell.proto";
+option java_outer_classname = "Messages";
+
+// ---------------------------------------------------------------------------
+// Client -> Server messages
+// ---------------------------------------------------------------------------
+
+message IncrementRequest {
+  string user_id = 1;
+}
+
+// 掲示板への新規投稿リクエスト
+message CreatePostRequest {
+  string author = 1;
+  string content = 2;
+}
+
+message ClientMessage {
+  oneof payload {
+    IncrementRequest increment = 1;
+    CreatePostRequest create_post = 2;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Server -> Client messages
+// ---------------------------------------------------------------------------
+
+message CounterUpdate {
+  int64 value = 1;
+  string cell_id = 2;
+  int64 timestamp = 3;
+}
+
+// 掲示板の 1 投稿
+message Post {
+  string id = 1;
+  string author = 2;
+  string content = 3;
+  string cell_id = 4;
+  int64 timestamp = 5;
+}
+
+// 接続直後に送る既存投稿の一覧（新しい順）
+message PostList {
+  repeated Post posts = 1;
+}
+
+message ServerMessage {
+  oneof payload {
+    CounterUpdate counter_update = 1;
+    // 新規投稿を全クライアントへブロードキャスト
+    Post post_added = 2;
+    // 接続時に送る初期一覧
+    PostList post_list = 3;
+  }
+}

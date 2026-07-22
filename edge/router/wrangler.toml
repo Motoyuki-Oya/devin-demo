@@ -1,0 +1,6 @@
+name = "edge-router"
+main = "src/index.ts"
+compatibility_date = "2023-12-01"
+
+# [vars]
+# MY_VARIABLE = "production_value"

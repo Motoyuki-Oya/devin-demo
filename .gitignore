@@ -1,6 +1,21 @@
+# Dependencies
 node_modules/
-npm-debug.log*
+
+# Build outputs
+dist/
+build/
+.astro/
+frontend/public/wasm/*.wasm
+
+# Gradle
+.gradle/
+backend/temp_gradle/
+
+# Logs
+*.log
+
+# Secrets / credentials
 .env
 .env.*
-*.log
-.DS_Store
+*.secret
+*パスワード*
