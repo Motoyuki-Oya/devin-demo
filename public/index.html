@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>devin-demo 掲示板</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="container">
+      <header>
+        <h1>devin-demo 掲示板</h1>
+        <p class="subtitle">
+          投稿するとリアルタイムに全員へ配信される簡易掲示板です（認証なし）。
+          <span id="status" class="status status--connecting">○ 接続中...</span>
+        </p>
+      </header>
+
+      <form id="post-form" class="card">
+        <input
+          id="author"
+          type="text"
+          maxlength="50"
+          placeholder="名前（未入力なら名無しさん）"
+        />
+        <textarea
+          id="content"
+          rows="3"
+          maxlength="500"
+          placeholder="投稿内容を入力..."
+        ></textarea>
+        <div class="form-footer">
+          <span id="counter" class="counter">0 / 500</span>
+          <button id="submit" type="submit" disabled>投稿する</button>
+        </div>
+      </form>
+
+      <ul id="posts" class="posts"></ul>
+      <p id="empty" class="empty">まだ投稿はありません。最初の投稿をしてみましょう。</p>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
