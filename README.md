@@ -43,6 +43,22 @@ npm run dev
 
 ブラウザで http://localhost:4321 を開くと掲示板が表示されます。
 
+### バックエンド接続先の変更（別ホスト / トンネル経由）
+
+フロントエンドの接続先は既定で `https://localhost:8443` です。別ホストやトンネル（Cloudflare Tunnel 等）越しに公開する場合は `PUBLIC_BACKEND_URL` を指定します。
+
+```sh
+cd frontend
+PUBLIC_BACKEND_URL=https://example.trycloudflare.com npm run dev   # dev
+PUBLIC_BACKEND_URL=https://example.trycloudflare.com npm run build # build 時に埋め込まれる
+```
+
+`https://` は `wss://`、`http://` は `ws://` に自動変換されます。バックエンド側は WebSocket の Origin 許可リストに公開元のオリジンを追加してください。
+
+```sh
+EDGECELL_ALLOWED_ORIGINS=https://frontend.example.trycloudflare.com ./gradlew quarkusDev
+```
+
 ## 掲示板の仕組み
 
 ```
