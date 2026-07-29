@@ -59,19 +59,110 @@ PUBLIC_BACKEND_URL=https://example.trycloudflare.com npm run build # build 時�
 EDGECELL_ALLOWED_ORIGINS=https://frontend.example.trycloudflare.com ./gradlew quarkusDev
 ```
 
-## 掲示板の仕組み
+## アーキテクチャ
 
+```mermaid
+flowchart TB
+    subgraph client["① ブラウザ (クライアント)"]
+        direction TB
+        astro["Astro 静的ページ<br/>index.astro"]
+        board["SolidJS アイランド<br/>Board.tsx / Counter.tsx"]
+        proto_js["protobufjs<br/>lib/proto.ts"]
+        wasm["WASM<br/>lib/wasm.ts"]
+        transport["EdgeCellTransport<br/>lib/transport.ts<br/>WebSocket + 自動再接続"]
+        astro --> board
+        board --> wasm
+        board --> proto_js --> transport
+    end
+
+    tunnel["② Cloudflare Quick Tunnel（デモ公開時のみ）<br/>TLS 終端: wss → ws"]
+
+    subgraph cell1["③ Cell / cell-01 (Quarkus + Kotlin)"]
+        direction TB
+        origin["WsOriginConfigurator<br/>Origin 検証 (CSWSH 対策)"]
+        socket["CellSocket<br/>@ServerEndpoint /ws/{userId}<br/>投稿 / リアクション / カウンター"]
+        listener["RedisPubSubListener<br/>購読 → ローカル全セッションへ配信"]
+        origin --> socket
+        listener -.->|"broadcastToLocalSessions()"| socket
+    end
+
+    subgraph cell2["③' Cell / cell-02（水平スケール時）"]
+        direction TB
+        socket2["CellSocket"]
+        listener2["RedisPubSubListener"]
+        listener2 -.-> socket2
+    end
+
+    subgraph redis["④ Dragonfly (Redis 互換)"]
+        direction LR
+        posts["LIST<br/>cell:{id}:posts<br/>Protobuf バイト列 / 最新100件"]
+        reactions["HASH<br/>cell:{id}:post:{postId}:reactions<br/>field: 絵文字+名前 / TTL 30日"]
+        counter["STRING<br/>cell:{id}:counter"]
+        pubsub[["Pub/Sub チャネル<br/>cell:{id}:updates"]]
+    end
+
+    transport <==>|"wss: Protobuf バイナリ"| tunnel
+    tunnel <==>|"ws: :8080"| origin
+
+    socket -->|"LPUSH / LTRIM / LRANGE"| posts
+    socket -->|"HDEL / HSETNX / HGETALL"| reactions
+    socket -->|"INCR"| counter
+    socket ==>|"PUBLISH"| pubsub
+    socket2 ==>|"PUBLISH"| pubsub
+    pubsub ==>|"SUBSCRIBE"| listener
+    pubsub ==>|"SUBSCRIBE"| listener2
 ```
-ブラウザ ──WebSocket(wss://localhost:8443/ws/{userId})──▶ CellSocket (Quarkus)
-  投稿(CreatePostRequest, Protobuf) ─▶ Redis LPUSH cell:{id}:posts (+LTRIM 最新100件)
-                                    └▶ Redis PUBLISH cell:{id}:updates (post_added)
-                                          │
-  RedisPubSubListener ──subscribe──▶ 全接続クライアントへ broadcast
-ブラウザ ◀── 接続時に PostList（既存投稿・新しい順）を受信
+
+ポイント:
+
+- **状態は Cell に持たない**。投稿・リアクションは Dragonfly に集約し、Cell は WebSocket の口だけを持つステートレスな存在。だから Cell を増やしても整合性が壊れない。
+- **配信は Pub/Sub 経由**。自分のセッションへ直接送るのではなく、必ず `cell:{id}:updates` に PUBLISH して購読側で配る。これにより**別 Cell につながっているクライアントにも同じ更新が届く**。
+- **ブラウザ ⇄ Cell は Protobuf バイナリ**。JSON ではなく `messages.proto` で定義したスキーマをそのまま流す。
+- **② のトンネルはデモ公開時だけの経路**。ローカル開発では `wss://localhost:8443` に直接つなぐ。
+
+## 掲示板の仕組み（メッセージの流れ）
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as ブラウザA (投稿者)
+    participant B as ブラウザB (別の閲覧者)
+    participant S as CellSocket<br/>(Quarkus)
+    participant R as Dragonfly<br/>(Redis 互換)
+    participant L as RedisPubSubListener
+
+    Note over A,S: 接続時
+    A->>S: WebSocket 接続 /ws/{userId}
+    S->>R: LRANGE cell:01:posts 0 99
+    S->>R: HGETALL 各投稿の reactions
+    S-->>A: ServerMessage.post_list (Protobuf)
+
+    Note over A,B: 投稿
+    A->>S: ClientMessage.create_post
+    S->>R: LPUSH + LTRIM (最新100件に維持)
+    S->>R: PUBLISH cell:01:updates<br/>ServerMessage.post_added
+    R-->>L: Pub/Sub 配信
+    L->>S: broadcastToLocalSessions()
+    S-->>A: post_added
+    S-->>B: post_added
+
+    Note over A,B: リアクション (トグル)
+    B->>S: ClientMessage.toggle_reaction<br/>{post_id, 絵文字, 名前}
+    S->>R: HDEL field
+    alt 消えなかった (未リアクション)
+        S->>R: HSETNX field + EXPIRE
+    end
+    S->>R: HGETALL → 最新の全量を組み立て
+    S->>R: PUBLISH ServerMessage.reaction_update
+    R-->>L: Pub/Sub 配信
+    L->>S: broadcastToLocalSessions()
+    S-->>A: reaction_update
+    S-->>B: reaction_update
 ```
 
 - 投稿の送受信は Protobuf（`*/proto/messages.proto`）でシリアライズ。
 - 空名は「名無しさん」に、本文は最大 500 文字・投稿は最新 100 件保持。
+- リアクションは**認証がないため名前を識別子**として扱い、同じ名前で同じ絵文字を再送すると解除される（トグル）。ハッシュのフィールドを `絵文字 + 名前` にすることで、付け外しが単一フィールドの追加/削除になり同時操作で更新が失われない。
 
 ## ディレクトリ構成
 
@@ -90,7 +181,8 @@ devin-demo/
 ## 拡張のヒント
 
 - **投稿の永続化強化**: 現状 Redis List（揮発しうる）。Aurora 等の RDB 書き込みを追加できる（REQUIREMENTS.md 参照）。
-- **削除・いいね等**: `messages.proto` にメッセージを追加し、`CellSocket.kt` と `Board.tsx` を拡張。
+- **削除・編集等**: `messages.proto` にメッセージを追加し、`CellSocket.kt` と `Board.tsx` を拡張。リアクション機能がこの手順の実例。
+  なお `messages.proto` は backend / `frontend/proto` / `frontend/public/proto` の 3 箇所に複製されているため、変更時は 3 つとも更新すること。
 - **マルチCell / エッジルーティング**: `edge/router` の Sticky ルーティングを実配線する。
 
 > 掲示板機能を追加した際の差分は edge-cell-core の PR も参照:
