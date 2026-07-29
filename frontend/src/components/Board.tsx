@@ -1,5 +1,10 @@
 import { createSignal, For, onCleanup, onMount, Show } from 'solid-js';
-import { createPostMessage, parseServerMessage, toggleReactionMessage } from '../lib/proto';
+import {
+  createPostMessage,
+  editPostMessage,
+  parseServerMessage,
+  toggleReactionMessage,
+} from '../lib/proto';
 import { EdgeCellTransport } from '../lib/transport';
 import { BACKEND_URL } from '../lib/config';
 
@@ -15,12 +20,16 @@ interface BoardPost {
   cellId: string;
   timestamp: number;
   reactions: PostReaction[];
+  // 投稿時にパスワードが設定された投稿だけ編集できる
+  editable: boolean;
+  editedAt: number;
 }
 
 type ConnStatus = 'connecting' | 'open' | 'closed' | 'error';
 
 const AUTHOR_STORAGE_KEY = 'edgecell.board.author';
 const MAX_CONTENT_LEN = 500;
+const MAX_PASSWORD_LEN = 128;
 // サーバ側の許可リスト（CellSocket.ALLOWED_EMOJIS）と一致させる
 const REACTION_EMOJIS = ['\u{1F44D}', '\u{1F602}', '\u{1F622}', '\u{1F389}', '\u2764\uFE0F', '\u{1F64F}'];
 // 認証がないため名前を識別子に使う。空欄はサーバ側と同じ既定名に寄せる。
@@ -43,6 +52,12 @@ export default function Board() {
   const [status, setStatus] = createSignal<ConnStatus>('closed');
   const [author, setAuthor] = createSignal<string>('');
   const [content, setContent] = createSignal<string>('');
+  const [password, setPassword] = createSignal<string>('');
+  // 編集中の投稿（id と入力途中の本文・パスワード）。同時に 1 件だけ編集する。
+  const [editingId, setEditingId] = createSignal<string | null>(null);
+  const [editContent, setEditContent] = createSignal<string>('');
+  const [editPassword, setEditPassword] = createSignal<string>('');
+  const [editError, setEditError] = createSignal<string>('');
   const [transport, setTransport] = createSignal<EdgeCellTransport | null>(null);
   // 絵文字パレットを開いている投稿の id（同時に 1 つだけ）
   const [pickerFor, setPickerFor] = createSignal<string | null>(null);
@@ -66,6 +81,8 @@ export default function Board() {
     // protobufjs は int64 を Long で返しうるので Number に正規化
     timestamp: typeof p.timestamp === 'object' ? Number(p.timestamp) : Number(p.timestamp ?? 0),
     reactions: toReactions(p.reactions),
+    editable: Boolean(p.editable),
+    editedAt: typeof p.editedAt === 'object' ? Number(p.editedAt) : Number(p.editedAt ?? 0),
   });
 
   onMount(() => {
@@ -104,6 +121,18 @@ export default function Board() {
           const post = toBoardPost(msg.postAdded);
           // 重複配信に備えて id で去重し、先頭に追加
           setPosts((prev) => (prev.some((p) => p.id === post.id) ? prev : [post, ...prev]));
+        } else if (msg.postUpdated) {
+          // 編集された投稿。リアクションも含む最新の全量が届く
+          const post = toBoardPost(msg.postUpdated);
+          setPosts((prev) => prev.map((p) => (p.id === post.id ? post : p)));
+        } else if (msg.editResult) {
+          // 成否は要求したセッションにのみ返る
+          const postId = String(msg.editResult.postId ?? '');
+          if (msg.editResult.ok) {
+            if (editingId() === postId) closeEditor();
+          } else {
+            setEditError(String(msg.editResult.message ?? '編集できませんでした'));
+          }
         } else if (msg.reactionUpdate) {
           // 差分ではなく該当投稿のリアクション全量が届く
           const postId = String(msg.reactionUpdate.postId ?? '');
@@ -131,8 +160,34 @@ export default function Board() {
       localStorage.setItem(AUTHOR_STORAGE_KEY, name);
     }
 
-    t.send(createPostMessage(name, body));
+    t.send(createPostMessage(name, body, password()));
     setContent('');
+    setPassword('');
+  };
+
+  const openEditor = (post: BoardPost) => {
+    setEditingId(post.id);
+    setEditContent(post.content);
+    setEditPassword('');
+    setEditError('');
+    setPickerFor(null);
+  };
+
+  const closeEditor = () => {
+    setEditingId(null);
+    setEditContent('');
+    setEditPassword('');
+    setEditError('');
+  };
+
+  const submitEdit = (e: Event) => {
+    e.preventDefault();
+    const t = transport();
+    const postId = editingId();
+    const body = editContent().trim();
+    if (!t || !t.isConnected() || !postId || body.length === 0) return;
+    setEditError('');
+    t.send(editPostMessage(postId, body, editPassword()));
   };
 
   /** リアクションの識別子。サーバ側の正規化と揃えて自分の分を判定できるようにする。 */
@@ -180,6 +235,20 @@ export default function Board() {
             'font-size': '0.95em',
             'font-family': 'inherit',
             resize: 'vertical',
+          }}
+        />
+        <input
+          type="password"
+          placeholder="編集用パスワード（任意。入力するとこの投稿を後から編集できます）"
+          maxLength={MAX_PASSWORD_LEN}
+          autocomplete="new-password"
+          value={password()}
+          onInput={(e) => setPassword(e.currentTarget.value)}
+          style={{
+            padding: '10px 12px',
+            'border-radius': '8px',
+            border: '1px solid #ccc',
+            'font-size': '0.95em',
           }}
         />
         <div style={{ display: 'flex', 'align-items': 'center', 'justify-content': 'space-between', gap: '12px' }}>
@@ -233,12 +302,86 @@ export default function Board() {
                 <div style={{ display: 'flex', 'align-items': 'baseline', 'justify-content': 'space-between', gap: '8px', 'margin-bottom': '6px' }}>
                   <strong style={{ color: '#1976d2' }}>{post.author}</strong>
                   <span style={{ 'font-size': '0.75em', color: '#999' }}>
-                    {formatTime(post.timestamp)}{post.cellId ? ` · ${post.cellId}` : ''}
+                    {formatTime(post.timestamp)}
+                    {post.editedAt > 0 ? ' · 編集済み' : ''}
+                    {post.cellId ? ` · ${post.cellId}` : ''}
                   </span>
                 </div>
-                <div style={{ 'white-space': 'pre-wrap', 'word-break': 'break-word', color: '#222' }}>
-                  {post.content}
-                </div>
+
+                <Show
+                  when={editingId() === post.id}
+                  fallback={
+                    <div style={{ 'white-space': 'pre-wrap', 'word-break': 'break-word', color: '#222' }}>
+                      {post.content}
+                    </div>
+                  }
+                >
+                  <form onSubmit={submitEdit} style={{ display: 'flex', 'flex-direction': 'column', gap: '8px' }}>
+                    <textarea
+                      rows={3}
+                      maxLength={MAX_CONTENT_LEN}
+                      value={editContent()}
+                      onInput={(e) => setEditContent(e.currentTarget.value)}
+                      style={{
+                        padding: '8px 10px',
+                        'border-radius': '8px',
+                        border: '1px solid #ccc',
+                        'font-size': '0.95em',
+                        'font-family': 'inherit',
+                        resize: 'vertical',
+                      }}
+                    />
+                    <input
+                      type="password"
+                      placeholder="投稿時に設定したパスワード"
+                      maxLength={MAX_PASSWORD_LEN}
+                      autocomplete="off"
+                      value={editPassword()}
+                      onInput={(e) => setEditPassword(e.currentTarget.value)}
+                      style={{
+                        padding: '8px 10px',
+                        'border-radius': '8px',
+                        border: '1px solid #ccc',
+                        'font-size': '0.95em',
+                      }}
+                    />
+                    <Show when={editError().length > 0}>
+                      <span style={{ 'font-size': '0.8em', color: '#d32f2f' }}>{editError()}</span>
+                    </Show>
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      <button
+                        type="submit"
+                        disabled={status() !== 'open' || editContent().trim().length === 0}
+                        style={{
+                          padding: '6px 16px',
+                          'border-radius': '8px',
+                          border: '1px solid #1976d2',
+                          'background-color': '#1976d2',
+                          color: '#fff',
+                          'font-size': '0.85em',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        保存
+                      </button>
+                      <button
+                        type="button"
+                        onClick={closeEditor}
+                        style={{
+                          padding: '6px 16px',
+                          'border-radius': '8px',
+                          border: '1px solid #ccc',
+                          'background-color': '#fff',
+                          color: '#555',
+                          'font-size': '0.85em',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        キャンセル
+                      </button>
+                    </div>
+                  </form>
+                </Show>
 
                 <div style={{ display: 'flex', 'align-items': 'center', 'flex-wrap': 'wrap', gap: '6px', 'margin-top': '10px' }}>
                   <For each={post.reactions}>
@@ -289,6 +432,26 @@ export default function Board() {
                   >
                     ＋
                   </button>
+
+                  <Show when={post.editable && editingId() !== post.id}>
+                    <button
+                      type="button"
+                      disabled={status() !== 'open'}
+                      onClick={() => openEditor(post)}
+                      style={{
+                        padding: '2px 8px',
+                        'border-radius': '12px',
+                        border: '1px solid #ddd',
+                        'background-color': '#fff',
+                        color: '#777',
+                        'font-size': '0.85em',
+                        'line-height': '1.6',
+                        cursor: status() === 'open' ? 'pointer' : 'not-allowed',
+                      }}
+                    >
+                      編集
+                    </button>
+                  </Show>
 
                   <Show when={pickerFor() === post.id}>
                     <div style={{ display: 'flex', gap: '2px', padding: '2px 6px', border: '1px solid #ddd', 'border-radius': '12px', 'background-color': '#fff' }}>
