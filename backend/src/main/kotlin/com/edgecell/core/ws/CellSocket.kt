@@ -4,6 +4,9 @@ import com.edgecell.proto.Messages
 import io.quarkus.redis.datasource.ReactiveRedisDataSource
 import io.smallrye.mutiny.Uni
 import io.smallrye.mutiny.infrastructure.Infrastructure
+import io.vertx.mutiny.redis.client.Redis
+import io.vertx.mutiny.redis.client.Request
+import io.vertx.mutiny.redis.client.Command
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import org.eclipse.microprofile.config.inject.ConfigProperty
@@ -12,6 +15,7 @@ import jakarta.websocket.server.PathParam
 import jakarta.websocket.server.ServerEndpoint
 import org.jboss.logging.Logger
 import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Base64
@@ -62,9 +66,19 @@ class CellSocket {
         private const val SALT_BYTES = 16
         private val secureRandom = SecureRandom()
 
-        // LSET する直前に LINDEX で読み直して同じ投稿か確かめる。同時 LPUSH で添字がずれた
-        // 場合はやり直す（LIST は id で直接引けないため）。
-        private const val MAX_LSET_ATTEMPTS = 3
+        // LIST は id で直接引けないため、添字の探索と LSET を 1 つの Lua スクリプトにまとめて
+        // 原子的に行う。別リクエストの LPUSH で添字がずれても他の投稿を上書きしない。
+        private const val LSET_BY_ID_SCRIPT = """
+            local len = redis.call('LLEN', KEYS[1])
+            for i = 0, len - 1 do
+              local row = redis.call('LINDEX', KEYS[1], i)
+              if row and string.sub(row, 1, #ARGV[1]) == ARGV[1] then
+                redis.call('LSET', KEYS[1], i, ARGV[2])
+                return 1
+              end
+            end
+            return 0
+        """
     }
 
     @Inject
@@ -73,6 +87,11 @@ class CellSocket {
 
     @Inject
     lateinit var redis: ReactiveRedisDataSource
+
+    // Lua スクリプトへ protobuf のバイト列をそのまま渡すため、バイナリ安全な低レベル
+    // クライアントを使う（ReactiveRedisDataSource は EVAL の引数を文字列しか取れない）。
+    @Inject
+    lateinit var redisClient: Redis
 
     private fun postsKey() = "cell:$cellId:posts"
 
@@ -311,8 +330,9 @@ class CellSocket {
         val storeAuth: Uni<Void> =
             if (password.isEmpty()) Uni.createFrom().voidItem()
             else hashPassword(password).flatMap { encoded ->
-                redis.value(String::class.java)
-                    .setex(authKey(post.id), REACTION_TTL_SECONDS, encoded)
+                // 投稿本体と同じく TTL は付けない。先に失効すると「編集」ボタンは出るのに
+                // 正しいパスワードでも編集できない投稿になる。
+                redis.value(String::class.java).set(authKey(post.id), encoded)
             }
 
         // LPUSH で先頭に積み、LTRIM で最新 MAX_POSTS 件に切り詰める
@@ -358,7 +378,7 @@ class CellSocket {
             }
             .flatMap { authorized ->
                 if (!authorized) Uni.createFrom().nullItem<Messages.Post?>()
-                else replacePostContent(postId, content, MAX_LSET_ATTEMPTS)
+                else replacePostContent(postId, content)
             }
             .subscribe().with(
                 { updated ->
@@ -389,32 +409,46 @@ class CellSocket {
 
     /**
      * LIST 内の該当投稿を本文を差し替えたもので上書きする。存在しなければ null。
-     * 添字を探してから LSET するまでの間に同時投稿でずれることがあるため、LSET 直前に
-     * LINDEX で同一投稿であることを確かめ、ずれていたらやり直す。
+     * 差し替え先の特定と書き込みは Lua スクリプト内で行うため、同時投稿で添字がずれても
+     * 別の投稿を上書きすることはない。
      */
-    private fun replacePostContent(postId: String, content: String, attempts: Int): Uni<Messages.Post?> {
-        if (attempts <= 0) return Uni.createFrom().nullItem()
-        val list = redis.list(ByteArray::class.java)
+    private fun replacePostContent(postId: String, content: String): Uni<Messages.Post?> =
+        redis.list(ByteArray::class.java).lrange(postsKey(), 0, MAX_POSTS - 1).flatMap { rows ->
+            val post = rows.asSequence()
+                .mapNotNull { bytes -> parsePost(bytes) }
+                .firstOrNull { it.id == postId }
+                ?: return@flatMap Uni.createFrom().nullItem<Messages.Post?>()
 
-        return list.lrange(postsKey(), 0, MAX_POSTS - 1).flatMap { rows ->
-            val index = rows.indexOfFirst { bytes -> parsePost(bytes)?.id == postId }
-            if (index < 0) return@flatMap Uni.createFrom().nullItem<Messages.Post?>()
+            val updated = post.toBuilder()
+                .setContent(content)
+                .setEditedAt(System.currentTimeMillis())
+                .build()
 
-            list.lindex(postsKey(), index.toLong()).flatMap { current ->
-                val post = current?.let { parsePost(it) }
-                if (post == null || post.id != postId) {
-                    replacePostContent(postId, content, attempts - 1)
-                } else {
-                    val updated = post.toBuilder()
-                        .setContent(content)
-                        .setEditedAt(System.currentTimeMillis())
-                        .build()
-                    list.lset(postsKey(), index.toLong(), updated.toByteArray())
-                        .flatMap { reactionsOf(postId) }
-                        .map { reactions -> updated.toBuilder().addAllReactions(reactions).build() }
-                }
+            lsetById(postId, updated.toByteArray()).flatMap { replaced ->
+                if (!replaced) Uni.createFrom().nullItem()
+                else reactionsOf(postId)
+                    .map { reactions -> updated.toBuilder().addAllReactions(reactions).build() }
             }
         }
+
+    /** LIST から id が一致する要素を探して差し替える。見つからなければ false。 */
+    private fun lsetById(postId: String, value: ByteArray): Uni<Boolean> {
+        val request = Request.cmd(Command.EVAL)
+            .arg(LSET_BY_ID_SCRIPT)
+            .arg(1)
+            .arg(postsKey())
+            .arg(idFieldPrefix(postId))
+            .arg(value)
+        return redisClient.send(request).map { response -> response?.toInteger() == 1 }
+    }
+
+    /**
+     * Post の protobuf は field 1 (id) が先頭に並ぶため、"tag + 長さ + id" が前方一致すれば
+     * その要素が該当投稿。id は 64 文字以内なので長さは 1 バイトに収まる。
+     */
+    private fun idFieldPrefix(postId: String): ByteArray {
+        val idBytes = postId.toByteArray(StandardCharsets.UTF_8)
+        return byteArrayOf(0x0A, idBytes.size.toByte()) + idBytes
     }
 
     private fun parsePost(bytes: ByteArray): Messages.Post? =
