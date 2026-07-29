@@ -2,6 +2,7 @@ package com.edgecell.core.ws
 
 import com.edgecell.proto.Messages
 import io.quarkus.redis.datasource.ReactiveRedisDataSource
+import io.smallrye.mutiny.Uni
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import org.eclipse.microprofile.config.inject.ConfigProperty
@@ -30,6 +31,23 @@ class CellSocket {
         private const val MAX_POSTS = 100L
         private const val MAX_AUTHOR_LEN = 50
         private const val MAX_CONTENT_LEN = 500
+
+        private const val DEFAULT_AUTHOR = "名無しさん"
+
+        // リアクション: フロントのパレットと一致させる。許可リスト外は破棄する（任意の文字列で
+        // ハッシュのフィールドを増やされるのを防ぐ）。
+        private val ALLOWED_EMOJIS = setOf("👍", "😂", "😢", "🎉", "❤️", "🙏")
+
+        // 1 投稿あたりのリアクション数（絵文字 × 人数）の上限
+        private const val MAX_REACTIONS_PER_POST = 500L
+
+        // 投稿は LTRIM で一覧から溢れるが、リアクションは別キーなので TTL で回収する
+        private const val REACTION_TTL_SECONDS = 60L * 60 * 24 * 30
+
+        private val POST_ID_PATTERN = Regex("^[A-Za-z0-9-]{1,64}$")
+
+        // ハッシュのフィールドは "{emoji}\n{author}"。author から改行を除くことで一意に分解できる。
+        private const val FIELD_SEPARATOR = '\n'
     }
 
     @Inject
@@ -40,6 +58,15 @@ class CellSocket {
     lateinit var redis: ReactiveRedisDataSource
 
     private fun postsKey() = "cell:$cellId:posts"
+
+    private fun reactionsKey(postId: String) = "cell:$cellId:post:$postId:reactions"
+
+    /** 名前は識別子として使うため、投稿とリアクションで同じ正規化を通す。 */
+    private fun sanitizeAuthor(raw: String): String =
+        raw.trim()
+            .filter { !it.isISOControl() }
+            .take(MAX_AUTHOR_LEN)
+            .ifBlank { DEFAULT_AUTHOR }
 
     @OnOpen
     fun onOpen(session: Session, @PathParam("userId") userId: String) {
@@ -104,6 +131,7 @@ class CellSocket {
 
             when {
                 clientMessage.hasCreatePost() -> handleCreatePost(clientMessage.createPost, session)
+                clientMessage.hasToggleReaction() -> handleToggleReaction(clientMessage.toggleReaction)
                 clientMessage.hasIncrement() -> handleIncrement()
             }
         } catch (e: Exception) {
@@ -119,18 +147,29 @@ class CellSocket {
         redis.list(ByteArray::class.java).lrange(postsKey(), 0, MAX_POSTS - 1)
             .subscribe().with(
                 { rows ->
-                    val postListBuilder = Messages.PostList.newBuilder()
-                    rows.forEach { bytes ->
+                    val posts = rows.mapNotNull { bytes ->
                         try {
-                            postListBuilder.addPosts(Messages.Post.parseFrom(bytes))
+                            Messages.Post.parseFrom(bytes)
                         } catch (e: Exception) {
                             log.warn("Skipping malformed post in Redis list", e)
+                            null
                         }
                     }
-                    val serverMessage = Messages.ServerMessage.newBuilder()
-                        .setPostList(postListBuilder.build())
-                        .build()
-                    session.asyncRemote.sendBinary(ByteBuffer.wrap(serverMessage.toByteArray()))
+                    attachReactions(posts).subscribe().with(
+                        { withReactions ->
+                            val serverMessage = Messages.ServerMessage.newBuilder()
+                                .setPostList(Messages.PostList.newBuilder().addAllPosts(withReactions))
+                                .build()
+                            session.asyncRemote.sendBinary(ByteBuffer.wrap(serverMessage.toByteArray()))
+                        },
+                        { error ->
+                            log.warn("Failed to load reactions for user $userId, sending posts without them", error)
+                            val serverMessage = Messages.ServerMessage.newBuilder()
+                                .setPostList(Messages.PostList.newBuilder().addAllPosts(posts))
+                                .build()
+                            session.asyncRemote.sendBinary(ByteBuffer.wrap(serverMessage.toByteArray()))
+                        }
+                    )
                 },
                 { error ->
                     log.warn("Redis LRANGE failed for user $userId on connect, sending empty list", error)
@@ -143,11 +182,99 @@ class CellSocket {
             )
     }
 
+    /** 各投稿に Redis 上のリアクションを載せて返す。 */
+    private fun attachReactions(posts: List<Messages.Post>): Uni<List<Messages.Post>> {
+        if (posts.isEmpty()) return Uni.createFrom().item(emptyList())
+        val unis = posts.map { post ->
+            reactionsOf(post.id).map { reactions -> post.toBuilder().addAllReactions(reactions).build() }
+        }
+        return Uni.join().all(unis).andFailFast()
+    }
+
+    /**
+     * リアクションは 1 投稿 = 1 ハッシュで保持し、フィールドを "{emoji}\n{author}" にする。
+     * 付け外しが単一フィールドの追加/削除になるため、read-modify-write の競合を避けられる。
+     */
+    private fun reactionsOf(postId: String): Uni<List<Messages.Reaction>> =
+        redis.hash(String::class.java).hgetall(reactionsKey(postId))
+            .map { fields -> groupReactions(fields.keys) }
+            .onFailure().recoverWithItem { error ->
+                log.warnf("Failed to read reactions for post %s (non-fatal): %s", postId, error.message)
+                emptyList()
+            }
+
+    /** 表示順を安定させるため、絵文字はパレットの並び順に揃える。 */
+    private fun groupReactions(fields: Set<String>): List<Messages.Reaction> {
+        val byEmoji = fields.mapNotNull { field ->
+            val separator = field.indexOf(FIELD_SEPARATOR)
+            if (separator <= 0) null else field.substring(0, separator) to field.substring(separator + 1)
+        }.groupBy({ it.first }, { it.second })
+
+        return ALLOWED_EMOJIS.mapNotNull { emoji ->
+            val authors = byEmoji[emoji] ?: return@mapNotNull null
+            Messages.Reaction.newBuilder()
+                .setEmoji(emoji)
+                .addAllAuthors(authors.sorted())
+                .build()
+        }
+    }
+
+    /**
+     * リアクションを付け外しする。まず HDEL を試し、消せなかった場合のみ追加する（同じ
+     * 名前で同じ絵文字を再送すると解除される = トグル）。
+     */
+    private fun handleToggleReaction(req: Messages.ToggleReactionRequest) {
+        val postId = req.postId
+        val emoji = req.emoji
+        if (!POST_ID_PATTERN.matches(postId)) {
+            log.warn("Rejected reaction: invalid postId format")
+            return
+        }
+        if (emoji !in ALLOWED_EMOJIS) {
+            log.warn("Rejected reaction: emoji not in allowlist")
+            return
+        }
+
+        val key = reactionsKey(postId)
+        val field = "$emoji$FIELD_SEPARATOR${sanitizeAuthor(req.author)}"
+        val hash = redis.hash(String::class.java)
+
+        hash.hdel(key, field)
+            .flatMap { removed ->
+                if (removed > 0) Uni.createFrom().item(true)
+                // 上限に達している場合は解除のみ許可し、追加は無視する
+                else hash.hlen(key).flatMap { size ->
+                    if (size >= MAX_REACTIONS_PER_POST) Uni.createFrom().item(false)
+                    else hash.hsetnx(key, field, "1")
+                        .flatMap { redis.key().expire(key, REACTION_TTL_SECONDS) }
+                }
+            }
+            .flatMap { reactionsOf(postId) }
+            .subscribe().with(
+                { reactions ->
+                    val serverMessage = Messages.ServerMessage.newBuilder()
+                        .setReactionUpdate(
+                            Messages.ReactionUpdate.newBuilder()
+                                .setPostId(postId)
+                                .addAllReactions(reactions)
+                        )
+                        .build()
+                    redis.pubsub(ByteArray::class.java)
+                        .publish("cell:$cellId:updates", serverMessage.toByteArray())
+                        .subscribe().with(
+                            { log.debug("Published reaction update to Redis") },
+                            { error -> log.error("Failed to publish reaction update to Redis", error) }
+                        )
+                },
+                { error -> log.error("Redis reaction toggle failed for post $postId", error) }
+            )
+    }
+
     /**
      * 新規投稿を受け付け、Redis に永続化してから pub/sub で全 Cell のクライアントへ配信する。
      */
     private fun handleCreatePost(req: Messages.CreatePostRequest, session: Session) {
-        val author = req.author.trim().take(MAX_AUTHOR_LEN).ifBlank { "名無しさん" }
+        val author = sanitizeAuthor(req.author)
         val content = req.content.trim().take(MAX_CONTENT_LEN)
         if (content.isEmpty()) {
             log.debug("Ignored empty post from $cellId")
