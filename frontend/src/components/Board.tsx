@@ -1,6 +1,7 @@
 import { createSignal, For, onCleanup, onMount, Show } from 'solid-js';
 import { createPostMessage, parseServerMessage } from '../lib/proto';
 import { EdgeCellTransport } from '../lib/transport';
+import { BACKEND_URL } from '../lib/config';
 
 interface BoardPost {
   id: string;
@@ -61,7 +62,7 @@ export default function Board() {
     setStatus('connecting');
 
     const t = new EdgeCellTransport({
-      url: 'https://localhost:8443',
+      url: BACKEND_URL,
       userId,
       onConnect: () => setStatus('open'),
       onDisconnect: () => setStatus('closed'),

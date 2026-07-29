@@ -1,6 +1,7 @@
 import { createSignal, onCleanup, onMount } from 'solid-js';
 import { createIncrementMessage, parseServerMessage } from '../lib/proto';
 import { EdgeCellTransport } from '../lib/transport';
+import { BACKEND_URL } from '../lib/config';
 
 export default function Counter() {
   const [count, setCount] = createSignal<number>(0);
@@ -22,7 +23,7 @@ export default function Counter() {
     setStatus('connecting');
 
     const t = new EdgeCellTransport({
-      url: 'https://localhost:8443',
+      url: BACKEND_URL,
       userId,
       onConnect: () => {
         setStatus('open');
