@@ -138,6 +138,9 @@ export default function Board() {
   /** リアクションの識別子。サーバ側の正規化と揃えて自分の分を判定できるようにする。 */
   const currentAuthor = () => author().trim() || DEFAULT_AUTHOR;
 
+  /** 認証がないため名前一致で判定する。同名は同一人物扱いになる。 */
+  const isMine = (post: BoardPost) => post.author === currentAuthor();
+
   const toggleReaction = (postId: string, emoji: string) => {
     const t = transport();
     if (!t || !t.isConnected()) return;
@@ -225,13 +228,31 @@ export default function Board() {
               <li
                 style={{
                   padding: '12px 14px',
-                  border: '1px solid #e0e0e0',
+                  border: isMine(post) ? '1px solid #1976d2' : '1px solid #e0e0e0',
+                  'border-left': isMine(post) ? '4px solid #1976d2' : undefined,
                   'border-radius': '10px',
-                  'background-color': '#fafafa',
+                  'background-color': isMine(post) ? '#e3f2fd' : '#fafafa',
                 }}
               >
                 <div style={{ display: 'flex', 'align-items': 'baseline', 'justify-content': 'space-between', gap: '8px', 'margin-bottom': '6px' }}>
-                  <strong style={{ color: '#1976d2' }}>{post.author}</strong>
+                  <strong style={{ color: '#1976d2' }}>
+                    {post.author}
+                    <Show when={isMine(post)}>
+                      <span
+                        style={{
+                          'margin-left': '6px',
+                          padding: '1px 6px',
+                          'border-radius': '10px',
+                          'background-color': '#1976d2',
+                          color: '#fff',
+                          'font-size': '0.7em',
+                          'font-weight': 'normal',
+                        }}
+                      >
+                        自分
+                      </span>
+                    </Show>
+                  </strong>
                   <span style={{ 'font-size': '0.75em', color: '#999' }}>
                     {formatTime(post.timestamp)}{post.cellId ? ` · ${post.cellId}` : ''}
                   </span>
