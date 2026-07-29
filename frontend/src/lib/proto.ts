@@ -9,8 +9,11 @@ export const ServerMessage = root.lookupType('edgecell.ServerMessage');
 export const IncrementRequest = root.lookupType('edgecell.IncrementRequest');
 export const CounterUpdate = root.lookupType('edgecell.CounterUpdate');
 export const CreatePostRequest = root.lookupType('edgecell.CreatePostRequest');
+export const ToggleReactionRequest = root.lookupType('edgecell.ToggleReactionRequest');
 export const Post = root.lookupType('edgecell.Post');
 export const PostList = root.lookupType('edgecell.PostList');
+export const Reaction = root.lookupType('edgecell.Reaction');
+export const ReactionUpdate = root.lookupType('edgecell.ReactionUpdate');
 
 // Helper to create INCREMENT message
 export function createIncrementMessage(userId: string): Uint8Array {
@@ -23,6 +26,13 @@ export function createIncrementMessage(userId: string): Uint8Array {
 export function createPostMessage(author: string, content: string): Uint8Array {
     const createPost = CreatePostRequest.create({ author, content });
     const clientMessage = ClientMessage.create({ createPost });
+    return ClientMessage.encode(clientMessage).finish();
+}
+
+// Helper to create a TOGGLE_REACTION message（同じ author が同じ絵文字を再送すると解除される）
+export function toggleReactionMessage(postId: string, emoji: string, author: string): Uint8Array {
+    const toggleReaction = ToggleReactionRequest.create({ postId, emoji, author });
+    const clientMessage = ClientMessage.create({ toggleReaction });
     return ClientMessage.encode(clientMessage).finish();
 }
 

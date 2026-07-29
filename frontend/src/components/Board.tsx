@@ -1,7 +1,12 @@
 import { createSignal, For, onCleanup, onMount, Show } from 'solid-js';
-import { createPostMessage, parseServerMessage } from '../lib/proto';
+import { createPostMessage, parseServerMessage, toggleReactionMessage } from '../lib/proto';
 import { EdgeCellTransport } from '../lib/transport';
 import { BACKEND_URL } from '../lib/config';
+
+interface PostReaction {
+  emoji: string;
+  authors: string[];
+}
 
 interface BoardPost {
   id: string;
@@ -9,12 +14,17 @@ interface BoardPost {
   content: string;
   cellId: string;
   timestamp: number;
+  reactions: PostReaction[];
 }
 
 type ConnStatus = 'connecting' | 'open' | 'closed' | 'error';
 
 const AUTHOR_STORAGE_KEY = 'edgecell.board.author';
 const MAX_CONTENT_LEN = 500;
+// サーバ側の許可リスト（CellSocket.ALLOWED_EMOJIS）と一致させる
+const REACTION_EMOJIS = ['\u{1F44D}', '\u{1F602}', '\u{1F622}', '\u{1F389}', '\u2764\uFE0F', '\u{1F64F}'];
+// 認証がないため名前を識別子に使う。空欄はサーバ側と同じ既定名に寄せる。
+const DEFAULT_AUTHOR = '名無しさん';
 
 function formatTime(ts: number): string {
   if (!ts) return '';
@@ -34,17 +44,28 @@ export default function Board() {
   const [author, setAuthor] = createSignal<string>('');
   const [content, setContent] = createSignal<string>('');
   const [transport, setTransport] = createSignal<EdgeCellTransport | null>(null);
+  // 絵文字パレットを開いている投稿の id（同時に 1 つだけ）
+  const [pickerFor, setPickerFor] = createSignal<string | null>(null);
 
   // このタブ限定のランダム userId（サーバ側 userId 形式チェックに適合）
   const userId = `user-${crypto.randomUUID()}`;
 
+  const toReactions = (list: any): PostReaction[] =>
+    (list ?? [])
+      .map((r: any) => ({
+        emoji: String(r.emoji ?? ''),
+        authors: (r.authors ?? []).map((a: any) => String(a)),
+      }))
+      .filter((r: PostReaction) => r.emoji.length > 0 && r.authors.length > 0);
+
   const toBoardPost = (p: any): BoardPost => ({
     id: String(p.id ?? ''),
-    author: String(p.author ?? '名無しさん'),
+    author: String(p.author ?? DEFAULT_AUTHOR),
     content: String(p.content ?? ''),
     cellId: String(p.cellId ?? ''),
     // protobufjs は int64 を Long で返しうるので Number に正規化
     timestamp: typeof p.timestamp === 'object' ? Number(p.timestamp) : Number(p.timestamp ?? 0),
+    reactions: toReactions(p.reactions),
   });
 
   onMount(() => {
@@ -83,6 +104,13 @@ export default function Board() {
           const post = toBoardPost(msg.postAdded);
           // 重複配信に備えて id で去重し、先頭に追加
           setPosts((prev) => (prev.some((p) => p.id === post.id) ? prev : [post, ...prev]));
+        } else if (msg.reactionUpdate) {
+          // 差分ではなく該当投稿のリアクション全量が届く
+          const postId = String(msg.reactionUpdate.postId ?? '');
+          const reactions = toReactions(msg.reactionUpdate.reactions);
+          setPosts((prev) =>
+            prev.map((p) => (p.id === postId ? { ...p, reactions } : p))
+          );
         }
       } catch (error) {
         console.error('Failed to parse message:', error);
@@ -105,6 +133,16 @@ export default function Board() {
 
     t.send(createPostMessage(name, body));
     setContent('');
+  };
+
+  /** リアクションの識別子。サーバ側の正規化と揃えて自分の分を判定できるようにする。 */
+  const currentAuthor = () => author().trim() || DEFAULT_AUTHOR;
+
+  const toggleReaction = (postId: string, emoji: string) => {
+    const t = transport();
+    if (!t || !t.isConnected()) return;
+    t.send(toggleReactionMessage(postId, emoji, author().trim()));
+    setPickerFor(null);
   };
 
   const statusLabel = () =>
@@ -200,6 +238,79 @@ export default function Board() {
                 </div>
                 <div style={{ 'white-space': 'pre-wrap', 'word-break': 'break-word', color: '#222' }}>
                   {post.content}
+                </div>
+
+                <div style={{ display: 'flex', 'align-items': 'center', 'flex-wrap': 'wrap', gap: '6px', 'margin-top': '10px' }}>
+                  <For each={post.reactions}>
+                    {(reaction) => {
+                      const mine = () => reaction.authors.includes(currentAuthor());
+                      return (
+                        <button
+                          type="button"
+                          title={reaction.authors.join(', ')}
+                          disabled={status() !== 'open'}
+                          onClick={() => toggleReaction(post.id, reaction.emoji)}
+                          style={{
+                            display: 'inline-flex',
+                            'align-items': 'center',
+                            gap: '4px',
+                            padding: '2px 8px',
+                            'border-radius': '12px',
+                            border: `1px solid ${mine() ? '#1976d2' : '#ddd'}`,
+                            'background-color': mine() ? '#e3f2fd' : '#fff',
+                            color: mine() ? '#1976d2' : '#555',
+                            'font-size': '0.85em',
+                            'line-height': '1.6',
+                            cursor: status() === 'open' ? 'pointer' : 'not-allowed',
+                          }}
+                        >
+                          <span>{reaction.emoji}</span>
+                          <span style={{ 'font-weight': mine() ? 'bold' : 'normal' }}>{reaction.authors.length}</span>
+                        </button>
+                      );
+                    }}
+                  </For>
+
+                  <button
+                    type="button"
+                    title="リアクションを追加"
+                    disabled={status() !== 'open'}
+                    onClick={() => setPickerFor(pickerFor() === post.id ? null : post.id)}
+                    style={{
+                      padding: '2px 8px',
+                      'border-radius': '12px',
+                      border: '1px dashed #bbb',
+                      'background-color': '#fff',
+                      color: '#777',
+                      'font-size': '0.85em',
+                      'line-height': '1.6',
+                      cursor: status() === 'open' ? 'pointer' : 'not-allowed',
+                    }}
+                  >
+                    ＋
+                  </button>
+
+                  <Show when={pickerFor() === post.id}>
+                    <div style={{ display: 'flex', gap: '2px', padding: '2px 6px', border: '1px solid #ddd', 'border-radius': '12px', 'background-color': '#fff' }}>
+                      <For each={REACTION_EMOJIS}>
+                        {(emoji) => (
+                          <button
+                            type="button"
+                            onClick={() => toggleReaction(post.id, emoji)}
+                            style={{
+                              border: 'none',
+                              background: 'none',
+                              padding: '2px 4px',
+                              'font-size': '1.1em',
+                              cursor: 'pointer',
+                            }}
+                          >
+                            {emoji}
+                          </button>
+                        )}
+                      </For>
+                    </div>
+                  </Show>
                 </div>
               </li>
             )}

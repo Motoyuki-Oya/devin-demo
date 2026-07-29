@@ -19,10 +19,18 @@ message CreatePostRequest {
   string content = 2;
 }
 
+// 投稿へのリアクションの付け外し（同じ author が同じ絵文字を再送すると解除される）
+message ToggleReactionRequest {
+  string post_id = 1;
+  string emoji = 2;
+  string author = 3;
+}
+
 message ClientMessage {
   oneof payload {
     IncrementRequest increment = 1;
     CreatePostRequest create_post = 2;
+    ToggleReactionRequest toggle_reaction = 3;
   }
 }
 
@@ -36,6 +44,12 @@ message CounterUpdate {
   int64 timestamp = 3;
 }
 
+// 1 つの絵文字に対するリアクション。authors は押した人の名前（掲示板は認証なしのため名前が識別子）。
+message Reaction {
+  string emoji = 1;
+  repeated string authors = 2;
+}
+
 // 掲示板の 1 投稿
 message Post {
   string id = 1;
@@ -43,11 +57,18 @@ message Post {
   string content = 3;
   string cell_id = 4;
   int64 timestamp = 5;
+  repeated Reaction reactions = 6;
 }
 
 // 接続直後に送る既存投稿の一覧（新しい順）
 message PostList {
   repeated Post posts = 1;
+}
+
+// 1 投稿のリアクションの最新状態（差分ではなく常に全量を送る）
+message ReactionUpdate {
+  string post_id = 1;
+  repeated Reaction reactions = 2;
 }
 
 message ServerMessage {
@@ -57,5 +78,7 @@ message ServerMessage {
     Post post_added = 2;
     // 接続時に送る初期一覧
     PostList post_list = 3;
+    // リアクション変更を全クライアントへブロードキャスト
+    ReactionUpdate reaction_update = 4;
   }
 }
